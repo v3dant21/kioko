@@ -1,7 +1,6 @@
 use axum::{
     extract::State,
     extract::Path,
-    http::StatusCode,
     response::IntoResponse,
     Json,
 };
@@ -34,15 +33,12 @@ pub struct GalleryResponse {
 pub async fn get_gallery(
     State(state): State<AppState>,
     Path(id): Path<String>,
-) -> Result<Json<GalleryResponse>, (StatusCode, String)> {
-    let keys = list_gallery_images(&state.s3_client, &state.bucket, &id)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+) -> Result<Json<GalleryResponse>, crate::error::AppError> {
+    let keys = list_gallery_images(&state.s3_client, &state.bucket, &id).await?;
 
-    let region = std::env::var("AWS_REGION").unwrap_or_else(|_| "eu-north-1".to_string());
     let images: Vec<String> = keys
         .iter()
-        .map(|key| get_public_url(&state.bucket, key, &region))
+        .map(|key| get_public_url(&state.bucket, key, &state.region))
         .collect();
 
     Ok(Json(GalleryResponse {

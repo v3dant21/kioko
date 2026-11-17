@@ -1,18 +1,26 @@
-import { useState, useCallback, useEffect } from 'react'
+import { useState, useCallback, useEffect, useMemo, useRef } from 'react'
 import './App.css'
+import { MotionConfig, motion } from 'motion/react'
+import { Plus, UploadSimple, ShareNetwork, Trash, Check, CaretLeft, CaretRight, SelectionAll, SelectionSlash, FolderPlus, LinkSimple, X, Copy, ImageSquare, Hourglass, DownloadSimple, Images } from '@phosphor-icons/react'
+import { Brand, SearchField, StudioIntro, Lifetime, WorkspaceFooter } from './Studio'
+import AlbumViewer from './AlbumViewer'
+import { prepare, publish, loadDraft, forgetDraft } from './publishing'
 
-const uid = () => Math.random().toString(16).slice(2) + Date.now().toString(16)
+const AnimatedBar = motion.div
+
+const uid = () => crypto.randomUUID()
 
 function App() {
   // Check if we're on a gallery viewer page
   const galleryMatch = window.location.pathname.match(/^\/g\/(.+)$/)
   const viewGalleryId = galleryMatch ? galleryMatch[1] : null
 
+  if (viewGalleryId?.startsWith('v2-')) return <AlbumViewer id={viewGalleryId.slice(3)} />
   if (viewGalleryId) {
     return <GalleryViewer galleryId={viewGalleryId} />
   }
 
-  return <UploadApp />
+  return <MotionConfig reducedMotion="user"><UploadApp /></MotionConfig>
 }
 
 function UploadApp() {
@@ -27,10 +35,27 @@ function UploadApp() {
   const [shareUrl, setShareUrl] = useState(null)
   const [showShareBox, setShowShareBox] = useState(false)
 
-  const filteredGallery = search.trim()
-    ? gallery.filter(x => x.name.toLowerCase().includes(search.toLowerCase()) ||
-      x.tags.some(t => t.toLowerCase().includes(search.toLowerCase())))
-    : gallery
+  const [page, setPage] = useState(0)
+  const [days, setDays] = useState(3)
+  const [job, setJob] = useState(null)
+  const [restored, setRestored] = useState(false)
+  const [deadline, setDeadline] = useState(null)
+  const picker = useRef(null)
+  const active = useRef(null)
+  useEffect(() => {
+    let mounted = true
+    loadDraft().then(draft => { if (mounted) setJob(draft) })
+      .catch(e => { if (mounted) setError(e.message) })
+      .finally(() => { if (mounted) setRestored(true) })
+    return () => { mounted = false; active.current?.abort() }
+  }, [])
+  const index = useMemo(() => new Map(gallery.map((photo, pos) =>
+    [photo.id, { pos, terms: [photo.name, ...photo.tags].map(t => t.toLowerCase()) }])), [gallery])
+  const term = search.trim().toLowerCase()
+  const filteredGallery = gallery.filter(item => !term || index.get(item.id).terms.some(t => t.includes(term)))
+  const pages = Math.max(1, Math.ceil(filteredGallery.length / 24))
+  const currentPage = Math.min(page, pages - 1)
+  const visible = filteredGallery.slice(currentPage * 24, (currentPage + 1) * 24)
 
   const selectedCount = gallery.filter(x => x.selected).length
 
@@ -87,7 +112,10 @@ function UploadApp() {
     setGallery(prev => prev.map(x => x.id === id ? { ...x, selected: !x.selected } : x))
   }
 
-  const selectAll = () => setGallery(prev => prev.map(x => ({ ...x, selected: true })))
+  const selectItems = items => {
+    const ids = new Set(items.map(x => x.id))
+    setGallery(prev => prev.map(x => ids.has(x.id) ? { ...x, selected: true } : x))
+  }
   const deselectAll = () => setGallery(prev => prev.map(x => ({ ...x, selected: false })))
 
   const addTag = (id, raw) => {
@@ -124,175 +152,108 @@ function UploadApp() {
     setAlbums(prev => prev.filter(a => a.id !== id))
   }
 
-  const copyLink = async (link) => {
-    await navigator.clipboard.writeText(link)
-  }
-
-  const uploadToServer = async () => {
+  const uploadToServer = async (album = null) => {
+    if (active.current) return
+    if (window.location.protocol === 'file:') {
+      setError('Publishing requires the running Kioku server. You can organize photos and create local albums in this preview.')
+      return
+    }
+    const controller = new AbortController()
+    active.current = controller
     setError('')
-    if (!gallery.length) {
-      setError('Add images first')
-      return
-    }
-
-    const toUpload = gallery.filter(x => !x.shareLink)
-    if (!toUpload.length) {
-      setError('All images already uploaded!')
-      return
-    }
-
     setUploading(true)
-    setProgress({ current: 0, total: toUpload.length, name: 'Preparing album...' })
+    setProgress({ current: 0, total: 0, name: 'Preparing album…' })
     try {
-      // Step 1: Create a new gallery
-      const createRes = await fetch('/api/gallery', { method: 'POST' })
-      if (!createRes.ok) throw new Error(await createRes.text())
-      const { gallery_id, share_url } = await createRes.json()
-
-      // Store the shareable gallery link
-      const fullShareUrl = window.location.origin + share_url
-      setShareUrl(fullShareUrl)
-      setShowShareBox(true)
-
-      // Step 2: Upload all images in one batch request
-      const fd = new FormData()
-      toUpload.forEach(item => fd.append('image', item.file))
-      setProgress({ current: 0, total: toUpload.length, name: 'Uploading album...' })
-
-      const uploadRes = await fetch(`/api/gallery/${gallery_id}/upload`, { method: 'POST', body: fd })
-      if (!uploadRes.ok) throw new Error(await uploadRes.text())
-      const data = await uploadRes.json()
-
-      // Mark all uploaded items with their S3 URLs
-      if (data.images && data.images.length) {
-        setGallery(prev => prev.map(x => {
-          const idx = toUpload.findIndex(u => u.id === x.id)
-          if (idx !== -1 && data.images[idx]) {
-            return { ...x, shareLink: data.images[idx] }
-          }
-          return x
-        }))
-        setProgress({ current: toUpload.length, total: toUpload.length, name: 'Complete!' })
+      let draft = job
+      if (!draft) {
+        const ids = album && new Set(album.ids)
+        const items = gallery.filter(x => ids ? ids.has(x.id) : selectedCount ? x.selected : !x.shareLink)
+        draft = await prepare(items, album?.name || 'Shared photos', days, controller.signal)
+        setJob(draft)
       }
+      const result = await publish(draft, gallery, controller.signal, setProgress)
+      const url = window.location.origin + result.url
+      setShareUrl(url)
+      setDeadline(result.expires_at)
+      setShowShareBox(true)
+      const ids = new Set(draft.manifest.photos.map(x => x.id))
+      setGallery(prev => prev.map(x => ids.has(x.id) ? { ...x, shareLink: url } : x))
+      await forgetDraft()
+      setJob(null)
     } catch (e) {
-      setError(e.message)
+      setError(controller.signal.aborted ? 'Upload paused.' : e.message)
     } finally {
       setUploading(false)
+      active.current = null
     }
   }
 
   return (
     <div className="app">
       <header className="header">
-        <a href="#" className="logo">
-          <span className="icon">photo_library</span>
-          <h1>Kioku</h1>
-        </a>
-        <div className="search-box">
-          <span className="icon">search</span>
-          <input
-            type="text"
-            placeholder="Search photos..."
-            value={search}
-            onChange={(e) => setSearch(e.target.value)}
-          />
-        </div>
-        <label className="header-btn">
-          <span className="icon">cloud_upload</span>Upload
-          <input
-            type="file"
-            accept="image/*"
-            multiple
-            hidden
-            onChange={(e) => { if (e.target.files.length) { addFiles(e.target.files); e.target.value = '' } }}
-          />
-        </label>
+        <Brand section="Workspace" />
+        {!!gallery.length && <SearchField label="Search photos or tags" value={search} onChange={value => { setSearch(value); setPage(0) }} />}
+        {!!gallery.length && <button className="btn add-more" onClick={() => picker.current?.click()}><Plus size={18} />Add photos</button>}
+        <input ref={picker} type="file" accept="image/png,image/jpeg,image/webp,image/gif" multiple hidden
+          onChange={e => { addFiles(e.target.files); e.target.value = '' }} />
       </header>
 
       <main className="main">
-        <div className="toolbar">
-          <div className="toolbar-left">
-            <h1 className="page-title">Photos</h1>
-            <span className="photo-count">{filteredGallery.length} photo{filteredGallery.length !== 1 ? 's' : ''}</span>
-          </div>
+        {!gallery.length && <StudioIntro pick={() => picker.current?.click()} onDrop={handleDrop} onDragOver={handleDragOver} onDragLeave={handleDragLeave} />}
+        <Lifetime value={job?.manifest.days ?? days} change={setDays} disabled={uploading || !!job} />
+        {(!!gallery.length || job || shareUrl || uploading) && <div className="toolbar">
+          <div className="toolbar-left"><h1 className="page-title">Your photos</h1><span className="photo-count">{filteredGallery.length}</span></div>
           <div className="toolbar-actions">
-            <button className="btn primary" onClick={uploadToServer} disabled={uploading}>
-              <span className="icon">backup</span>{uploading ? 'Uploading...' : 'Upload to Server'}
+            <button className="btn primary" onClick={() => uploadToServer()} disabled={uploading || !restored || (!job && !gallery.length)}>
+              <UploadSimple size={18} aria-hidden="true" />{uploading ? 'Uploading…' : job ? 'Resume ' + job.manifest.title : selectedCount ? 'Publish selected' : 'Publish new photos'}
             </button>
+            {uploading && <button className="btn" onClick={() => active.current?.abort()}>Pause</button>}
+            {job && !uploading && <button className="btn" onClick={async () => { try { await forgetDraft(); setJob(null); setError('') } catch (e) { setError(e.message) } }}>Discard local draft</button>}
             {shareUrl && (
               <button className="btn share" onClick={() => setShowShareBox(true)}>
-                <span className="icon">share</span>Share
+                <ShareNetwork size={18} aria-hidden="true" />Share
               </button>
             )}
-            <button className="btn danger" onClick={clearAll}>
-              <span className="icon">delete_sweep</span>Clear All
+            <button className="btn danger" disabled={!gallery.length} onClick={clearAll}>
+              <Trash size={18} aria-hidden="true" />Clear local workspace
             </button>
           </div>
-        </div>
+        </div>}
 
-        {!gallery.length && (
-          <div
-            className="upload-zone"
-            onDrop={handleDrop}
-            onDragOver={handleDragOver}
-            onDragLeave={handleDragLeave}
-          >
-            <span className="icon">add_photo_alternate</span>
-            <h3>Upload your photos</h3>
-            <p>Drag and drop images here or click to browse</p>
-            <label className="btn">
-              Browse Files
-              <input
-                type="file"
-                accept="image/*"
-                multiple
-                hidden
-                onChange={(e) => { if (e.target.files.length) { addFiles(e.target.files); e.target.value = '' } }}
-              />
-            </label>
-          </div>
-        )}
-
-        {error && <div className="error show">{error}</div>}
+        {error && <div role="alert" className="error show">{error}</div>}
 
         {showShareBox && shareUrl && (
-          <ShareLinkBox url={shareUrl} onClose={() => setShowShareBox(false)} />
+          <ShareLinkBox url={shareUrl} deadline={deadline} onClose={() => setShowShareBox(false)} />
         )}
 
         {uploading && (
           <div className="upload-progress show">
-            <span>Uploading {progress.current}/{progress.total}: {progress.name}</span>
+            <span>{progress.name} · {Math.round(progress.current / 1024)} / {Math.round(progress.total / 1024)} KiB confirmed</span>
             <div className="progress-bar">
-              <div className="progress-fill" style={{ width: `${progress.total ? (progress.current / progress.total) * 100 : 0}%` }} />
+              <div className="progress-fill" style={{ transform: `scaleX(${progress.total ? progress.current / progress.total : 0})` }} />
             </div>
           </div>
         )}
 
         <div className="masonry">
-          {filteredGallery.map((item, idx) => (
+          {visible.map((item) => (
             <PhotoCard
               key={item.id}
               item={item}
-              idx={gallery.indexOf(item)}
               hasSel={selectedCount > 0}
               onToggle={() => toggleSelect(item.id)}
               onDelete={() => deleteImg(item.id)}
-              onMove={(dir) => moveImg(gallery.indexOf(item), dir)}
+              onMove={(dir) => moveImg(index.get(item.id).pos, dir)}
               onAddTag={(tag) => addTag(item.id, tag)}
               onRemoveTag={(tag) => removeTag(item.id, tag)}
-              onCopy={copyLink}
             />
           ))}
         </div>
 
-        {!filteredGallery.length && gallery.length === 0 && (
-          <div className="empty">
-            <span className="icon">image_search</span>
-            <h3>No photos yet</h3>
-            <p>Upload some images to get started</p>
-          </div>
-        )}
-
+        {pages > 1 && <nav className="album-pages" aria-label="Workspace pages"><button disabled={!currentPage} onClick={() => setPage(currentPage - 1)}>Previous</button>
+          {' '}Page {currentPage + 1} of {pages}{' '}
+          <button disabled={currentPage + 1 === pages} onClick={() => setPage(currentPage + 1)}>Next</button></nav>}
+        {!!gallery.length && !filteredGallery.length && <p>No matching photos</p>}
         {albums.length > 0 && (
           <div className="albums">
             <h2 className="section-title">Collections</h2>
@@ -303,55 +264,56 @@ function UploadApp() {
                   album={album}
                   gallery={gallery}
                   onDelete={() => deleteAlbum(album.id)}
+                  onPublish={() => uploadToServer(album)} disabled={uploading || !!job || !restored}
                 />
               ))}
             </div>
           </div>
         )}
+        <WorkspaceFooter />
       </main>
 
       {selectedCount > 0 && (
-        <div className="sel-bar">
+        <AnimatedBar className="sel-bar" initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }}>
           <span className="sel-count">{selectedCount} selected</span>
           <div className="divider" />
-          <button className="sel-btn" onClick={selectAll}>
-            <span className="icon">select_all</span>Select All
+          <button className="sel-btn" onClick={() => selectItems(visible)}>
+            <SelectionAll size={18} aria-hidden="true" />Select page
           </button>
+          <button className="sel-btn" onClick={() => selectItems(filteredGallery)}>Select all matches</button>
           <button className="sel-btn" onClick={deselectAll}>
-            <span className="icon">deselect</span>Clear
+            <SelectionSlash size={18} aria-hidden="true" />Clear
           </button>
           <div className="divider" />
           <button className="sel-btn primary" onClick={() => setModalOpen(true)}>
-            <span className="icon">create_new_folder</span>Create Album
+            <FolderPlus size={18} aria-hidden="true" />Create Album
           </button>
-        </div>
+        </AnimatedBar>
       )}
 
-      {modalOpen && (
-        <div className="modal-bg" onClick={(e) => e.target === e.currentTarget && setModalOpen(false)}>
-          <div className="modal">
-            <h3>New Album</h3>
-            <input
-              type="text"
-              className="modal-input"
-              placeholder="Album name..."
-              value={albumName}
-              onChange={(e) => setAlbumName(e.target.value)}
-              onKeyPress={(e) => e.key === 'Enter' && createAlbum()}
-              autoFocus
-            />
-            <div className="modal-actions">
-              <button className="btn" onClick={() => setModalOpen(false)}>Cancel</button>
-              <button className="btn primary" onClick={createAlbum}>Create</button>
-            </div>
-          </div>
-        </div>
-      )}
+      {modalOpen && <AlbumDialog name={albumName} setName={setAlbumName} close={() => setModalOpen(false)} create={createAlbum} />}
     </div>
   )
 }
 
-function PhotoCard({ item, idx, hasSel, onToggle, onDelete, onMove, onAddTag, onRemoveTag, onCopy }) {
+function AlbumDialog({ name, setName, close, create }) {
+  const ref = useRef(null)
+  useEffect(() => {
+    const dialog = ref.current
+    dialog.showModal()
+    return () => dialog.close()
+  }, [])
+  return <dialog ref={ref} className="studio-dialog" aria-labelledby="album-title" onCancel={close}
+    onClick={e => { if (e.target === e.currentTarget) close() }}>
+    <form className="modal" onSubmit={e => { e.preventDefault(); create() }}>
+      <h2 id="album-title">New album</h2>
+      <label>Album name<input autoFocus required className="modal-input" placeholder="Album name..." value={name} onChange={e => setName(e.target.value)} /></label>
+      <div className="modal-actions"><button type="button" className="btn" onClick={close}>Cancel</button><button className="btn primary" disabled={!name.trim()}>Create</button></div>
+    </form>
+  </dialog>
+}
+
+function PhotoCard({ item, hasSel, onToggle, onDelete, onMove, onAddTag, onRemoveTag }) {
   const [tagInput, setTagInput] = useState('')
 
   const handleAddTag = () => {
@@ -366,21 +328,21 @@ function PhotoCard({ item, idx, hasSel, onToggle, onDelete, onMove, onAddTag, on
       <img src={item.url} alt={item.name} loading="lazy" />
       <div className="photo-overlay">
         <div className="card-top">
-          <div
+          <button aria-pressed={item.selected} aria-label={`Select ${item.name}`}
             className={`checkbox${item.selected ? ' checked visible' : ''}${hasSel ? ' visible' : ''}`}
             onClick={onToggle}
           >
-            {item.selected && <span className="icon">check</span>}
-          </div>
+            {item.selected && <Check size={18} aria-hidden="true" />}
+          </button>
           <div className="card-btns">
             <button className="card-btn" onClick={() => onMove(-1)} title="Move left">
-              <span className="icon">chevron_left</span>
+              <CaretLeft size={18} aria-hidden="true" />
             </button>
             <button className="card-btn" onClick={() => onMove(1)} title="Move right">
-              <span className="icon">chevron_right</span>
+              <CaretRight size={18} aria-hidden="true" />
             </button>
             <button className="card-btn del" onClick={onDelete} title="Delete">
-              <span className="icon">delete</span>
+              <Trash size={18} aria-hidden="true" />
             </button>
           </div>
         </div>
@@ -388,7 +350,7 @@ function PhotoCard({ item, idx, hasSel, onToggle, onDelete, onMove, onAddTag, on
           <div className="photo-name">{item.name}</div>
           <div className="tag-row">
             <input
-              className="tag-input"
+              aria-label={`Tags for ${item.name}`} className="tag-input"
               placeholder="Add tags..."
               value={tagInput}
               onChange={(e) => setTagInput(e.target.value)}
@@ -401,7 +363,7 @@ function PhotoCard({ item, idx, hasSel, onToggle, onDelete, onMove, onAddTag, on
               {item.tags.map(tag => (
                 <span key={tag} className="tag">
                   {tag}
-                  <button className="tag-x" onClick={() => onRemoveTag(tag)}>×</button>
+                  <button aria-label={`Remove tag ${tag}`} className="tag-x" onClick={() => onRemoveTag(tag)}>×</button>
                 </span>
               ))}
             </div>
@@ -413,7 +375,7 @@ function PhotoCard({ item, idx, hasSel, onToggle, onDelete, onMove, onAddTag, on
   )
 }
 
-function ShareLinkBox({ url, onClose }) {
+function ShareLinkBox({ url, deadline, onClose }) {
   const [copied, setCopied] = useState(false)
 
   const handleCopy = async () => {
@@ -425,16 +387,16 @@ function ShareLinkBox({ url, onClose }) {
   return (
     <div className="share-box">
       <div className="share-box-header">
-        <span className="icon">link</span>
-        <span className="share-box-title">Gallery Viewer (Images on S3)</span>
-        <button className="share-box-close" onClick={onClose}>
-          <span className="icon">close</span>
+        <LinkSimple size={18} aria-hidden="true" />
+        <span className="share-box-title">Share album · Expires {new Date(deadline * 1000).toLocaleString()}</span>
+        <button aria-label="Close share link" className="share-box-close" onClick={onClose}>
+          <X size={18} aria-hidden="true" />
         </button>
       </div>
       <div className="share-box-body">
         <input className="share-box-input" value={url} readOnly onClick={e => e.target.select()} />
         <button className={`share-box-copy${copied ? ' copied' : ''}`} onClick={handleCopy}>
-          <span className="icon">{copied ? 'check' : 'content_copy'}</span>
+          {copied ? <Check size={18} /> : <Copy size={18} />}
           {copied ? 'Copied!' : 'Copy'}
         </button>
       </div>
@@ -442,7 +404,7 @@ function ShareLinkBox({ url, onClose }) {
   )
 }
 
-function AlbumCard({ album, gallery, onDelete }) {
+function AlbumCard({ album, gallery, onDelete, onPublish, disabled }) {
   const images = album.ids.map(id => gallery.find(x => x.id === id)).filter(Boolean).slice(0, 4)
 
   return (
@@ -450,8 +412,8 @@ function AlbumCard({ album, gallery, onDelete }) {
       <div className="album-cover">
         {[0, 1, 2, 3].map(i => (
           images[i]
-            ? <img key={i} src={images[i].url} loading="lazy" />
-            : <div key={i} className="ph"><span className="icon">image</span></div>
+            ? <img key={i} src={images[i].url} alt="" loading="lazy" />
+            : <div key={i} className="ph"><ImageSquare size={18} aria-hidden="true" /></div>
         ))}
       </div>
       <div className="album-info">
@@ -459,8 +421,9 @@ function AlbumCard({ album, gallery, onDelete }) {
         <div className="album-count">{album.ids.filter(id => gallery.find(x => x.id === id)).length} photos</div>
       </div>
       <div className="album-actions">
+        <button className="btn" disabled={disabled || !images.length} onClick={onPublish}>Publish this album</button>
         <button className="btn" onClick={onDelete}>
-          <span className="icon">delete</span>Remove
+          <Trash size={18} aria-hidden="true" />Remove
         </button>
       </div>
     </div>
@@ -492,13 +455,13 @@ function GalleryViewer({ galleryId }) {
     <div className="app">
       <header className="header">
         <a href="/" className="logo">
-          <span className="icon">photo_library</span>
+          <Images size={18} aria-hidden="true" />
           <h1>Kioku</h1>
         </a>
         <div className="viewer-header-right">
           <span className="photo-count">{images.length} photo{images.length !== 1 ? 's' : ''}</span>
           <a className="btn primary" href={`/api/gallery/${galleryId}/download`}>
-            <span className="icon">download</span>Download All
+            <DownloadSimple size={18} aria-hidden="true" />Download All
           </a>
         </div>
       </header>
@@ -506,16 +469,16 @@ function GalleryViewer({ galleryId }) {
       <main className="main">
         {loading && (
           <div className="empty">
-            <span className="icon">hourglass_empty</span>
+            <Hourglass size={18} aria-hidden="true" />
             <h3>Loading gallery...</h3>
           </div>
         )}
 
-        {error && <div className="error show">{error}</div>}
+        {error && <div role="alert" className="error show">{error}</div>}
 
         {!loading && !error && images.length === 0 && (
           <div className="empty">
-            <span className="icon">image_search</span>
+            <ImageSquare size={18} aria-hidden="true" />
             <h3>Gallery is empty</h3>
             <p>No images found in this gallery</p>
           </div>

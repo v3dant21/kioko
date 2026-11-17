@@ -8,7 +8,7 @@ use axum::{
 use tower_http::cors::CorsLayer;
 use tower_http::services::ServeDir;
 
-use crate::file_ops::{download_gallery, upload_gallery};
+use crate::file_ops::{download_gallery, upload_gallery, };
 use crate::handler::{create_gallery, get_gallery, health_check_handler};
 use crate::AppState;
 
@@ -22,6 +22,7 @@ async fn spa_fallback() -> impl IntoResponse {
 pub fn create_routes(state: AppState) -> Router {
     Router::new()
         // API routes
+        .nest("/api/v2/albums", crate::albums::routes().layer(axum::middleware::map_response(|mut response: axum::response::Response| async move { response.headers_mut().insert("cache-control", axum::http::HeaderValue::from_static("private, no-store")); response })))
         .route("/api/health", get(health_check_handler))
         .route("/api/gallery", post(create_gallery))
         .route("/api/gallery/:id", get(get_gallery))

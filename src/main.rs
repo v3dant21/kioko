@@ -1,5 +1,7 @@
 use aws_sdk_s3::Client;
 use std::io::{self, Read};
+mod error;
+mod albums;
 mod file_ops;
 mod handler;
 mod routes;
@@ -9,6 +11,7 @@ mod s3;
 pub struct AppState {
     pub s3_client: Client,
     pub bucket: String,
+    pub region: String,
 }
 fn ignore_stdin() {
     std::thread::spawn(||{
@@ -32,13 +35,14 @@ async fn main() {
     dotenvy::dotenv().ok();
 
     let bucket = std::env::var("S3_BUCKET").expect("S3_BUCKET must be set");
-
+    let region = std::env::var("AWS_REGION").unwrap_or_else(|_| "eu-north-1".to_string());
 
     let config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
     let s3_client = Client::new(&config);
 
 
-    let state = AppState { s3_client, bucket };
+    let state = AppState { s3_client, bucket, region };
+    albums::start(state.clone());
     let app = routes::create_routes(state);
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:5000")

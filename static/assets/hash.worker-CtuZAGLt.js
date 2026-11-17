@@ -1,0 +1,1 @@
+(function(){"use strict";self.onmessage=async({data:e})=>{try{const s=new Uint8Array(await crypto.subtle.digest("SHA-256",await e.arrayBuffer()));self.postMessage({digest:Array.from(s,t=>t.toString(16).padStart(2,"0")).join("")})}catch(s){self.postMessage({error:s.message})}}})();
