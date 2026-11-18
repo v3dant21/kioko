@@ -2,7 +2,8 @@ Here is a clean, comprehensive, and professional `README.md` tailored precisely 
 
 ---
 
-# Omoide Tenji 
+kioko 
+
 
 Omoide Tenji is a high-performance, minimalist digital gallery platform built with **Rust** and **React**. The application features an asynchronous backend using **Axum** and **Tokio** to seamlessly process image multi-part uploads, interface directly with **AWS S3 / LocalStack** for scalable asset hosting, and compile assets on-the-fly into structured `.zip` data downloads.
 
